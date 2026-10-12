@@ -1,0 +1,27 @@
+# Personal notes: never committed
+docs-personal/
+
+# Local backups (upstream git history, removed upstream files)
+.local/
+
+# Build outputs and fetched sources
+vendor/
+bin/
+build/
+*.whl
+dist/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Claude Code: shared settings are committed, personal ones aren't
+.claude/settings.local.json
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/

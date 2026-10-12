@@ -1,0 +1,40 @@
+desc:Petal Pump - tempo-synced "sidechain" volume pump
+// SPDX-License-Identifier: Apache-2.0
+// The future-bass pump without a sidechain: gain dips at every step and recovers
+//   g(p) = 1 - depth * (1 - min(p / recovery, 1))^curve,   p = position in step (0-1)
+// Higher Curve recovers faster at first. The gain is smoothed by a ~1.5 ms
+// one-pole, so the dip at each step start doesn't click.
+// Follows the song position while playing; when stopped it free-runs at the
+// project tempo (if enabled), so the pump is audible while jamming.
+slider1:0.7<0,1,0.01>Depth
+slider2:1<0,2,1{1/2 note,1/4 note,1/8 note}>Rate
+slider3:0.6<0.05,1,0.01>Recovery (fraction of step)
+slider4:2<0.5,6,0.1>Curve
+slider5:1<0,1,1{Off,On}>Pump when stopped
+
+@init
+freeBeats = 0;
+gs = 1;
+kSmooth = exp(-1 / (0.0015 * srate));
+
+@slider
+stepBeats = ((slider2 == 0) ? 2 : ((slider2 == 1) ? 1 : 0.5));
+
+@block
+playing = play_state & 1;
+pos = (playing ? beat_position : freeBeats);
+beatInc = tempo / 60 / srate;
+
+@sample
+(playing || slider5) ? (
+  p = pos / stepBeats;
+  p -= floor(p);
+  target = 1 - slider1 * (1 - min(p / slider3, 1)) ^ slider4;
+  pos += beatInc;
+  playing ? 0 : (freeBeats = pos);
+) : (
+  target = 1;
+);
+gs = target + (gs - target) * kSmooth;
+spl0 *= gs;
+spl1 *= gs;

@@ -1,0 +1,154 @@
+desc:Fairy Vox - formant "vocal chop" synth (4-note poly)
+// SPDX-License-Identifier: Apache-2.0
+// Source: a PolyBLEP saw (glottal buzz) plus a little breath noise, through three
+// parallel band-pass resonators at the vowel's formants F1-F3 (state-variable
+// filters; Q 5 / 8 / 10, F1 widest as in real voices so it can't ring on the
+// fundamental). A tanh soft limiter keeps stacked resonances below 0 dBFS. Formant frequencies are female averages (Peterson & Barney):
+//   a 850/1220/2810  e 610/2330/2990  i 310/2790/3310  o 590/920/2710  u 370/950/2670
+// The vowel morphs smoothly in log frequency between neighbours. With "Vowel cycle"
+// on, each new note steps to the next vowel, like a chopped vocal sample.
+// Each note scoops up from -1 semitone (40 ms), gets delayed vibrato, and decays
+// with "Chop length", so short taps sound like chops and holds like a sung "ahh".
+slider1:0<0,4,0.01>Vowel (a e i o u)
+slider2:1<0,1,1{Off,On}>Vowel cycle
+slider3:0.35<0.05,4,0.01>Chop length (s)
+slider4:0.25<0,1,0.01>Vibrato depth (semitones)
+slider5:0.12<0,1,0.01>Breath
+slider6:0.6<0,1,0.01>Volume
+
+@init
+NV = 4;
+note = 0; vel = 8; env = 16; stage = 24; age = 32; vow = 40; t0 = 48; ph = 56; freq = 64;
+f1a = 100; f1b = 120; f1c = 140;   // SVF states: 3 formants x 2 states x NV
+fm = 200;                          // formant table: 5 vowels x 3
+fm[0] = 850;  fm[1] = 1220; fm[2] = 2810;
+fm[3] = 610;  fm[4] = 2330; fm[5] = 2990;
+fm[6] = 310;  fm[7] = 2790; fm[8] = 3310;
+fm[9] = 590;  fm[10] = 920; fm[11] = 2710;
+fm[12] = 370; fm[13] = 950; fm[14] = 2670;
+fgain = 220; fgain[0] = 1; fgain[1] = 0.55; fgain[2] = 0.3;
+// Make-up gain per vowel (dB), measured with bin/flagent_render so every vowel
+// has the same RMS as "a"; interpolated in dB while morphing
+vgain = 230; vgain[0] = 0; vgain[1] = 7; vgain[2] = 8.5; vgain[3] = 4.3; vgain[4] = 3.2;
+fq = 240; fq[0] = 1 / 5; fq[1] = 1 / 8; fq[2] = 1 / 10;   // 1/Q per formant
+v = 0;
+loop(NV, stage[v] = 0; v += 1;);
+cycleIndex = 0;
+clock = 0;
+bend = 1;
+vibPhase = 0;
+
+// Band-pass state-variable filter: one sample, states at st1/st2 (memory slots)
+function svfbp(x, fc, qk, st1, st2) local(g, a1, a2, a3, v1, v2, v3) (
+  g = tan($pi * min(fc, 0.45 * srate) / srate);
+  a1 = 1 / (1 + g * (g + qk));
+  a2 = g * a1;
+  a3 = g * a2;
+  v3 = x - st2[];
+  v1 = a1 * st1[] + a2 * v3;
+  v2 = st2[] + a2 * st1[] + a3 * v3;
+  st1[] = 2 * v1 - st1[];
+  st2[] = 2 * v2 - st2[];
+  v1 * qk;   // normalised: the band output peaks at Q = 1/qk otherwise
+);
+
+// Make-up gain (linear) for vowel position p
+function vowelGain(p) local(i0, i1, fr) (
+  i0 = floor(min(max(p, 0), 4));
+  i1 = min(i0 + 1, 4);
+  fr = p - i0;
+  10 ^ ((vgain[i0] * (1 - fr) + vgain[i1] * fr) / 20);
+);
+
+// Formant n (0-2) for vowel position p (0-4), morphing in log frequency
+function formant(p, n) local(i0, i1, fr) (
+  i0 = floor(min(max(p, 0), 4));
+  i1 = min(i0 + 1, 4);
+  fr = p - i0;
+  exp(log(fm[i0 * 3 + n]) * (1 - fr) + log(fm[i1 * 3 + n]) * fr);
+);
+
+@slider
+kChop = exp(-1 / (slider3 * srate));
+kRel = exp(-1 / (0.06 * srate));
+atkInc = 1 / (0.006 * srate);
+gain = slider6 * 0.9;
+
+@block
+while (midirecv(ofs, m1, m2, m3)) (
+  st = m1 & 0xF0;
+  (st == 0x90 && m3 > 0) ? (
+    best = -1;
+    v = 0;
+    loop(NV, (best < 0 && stage[v] == 0) ? (best = v); v += 1;);
+    (best < 0) ? (
+      best = 0;
+      v = 1;
+      loop(NV - 1, (age[v] < age[best]) ? (best = v); v += 1;);
+    );
+    clock += 1;
+    note[best] = m2;
+    vel[best] = m3 / 127;
+    freq[best] = 440 * 2 ^ ((m2 - 69) / 12);
+    stage[best] = 1;
+    age[best] = clock;
+    t0[best] = 0;
+    vow[best] = (slider2 ? (slider1 + cycleIndex) - 5 * floor((slider1 + cycleIndex) / 5) : slider1);
+    (vow[best] > 4) ? (vow[best] = 4);
+    cycleIndex = (cycleIndex + 1) % 5;
+  ) : (st == 0x80 || st == 0x90) ? (
+    v = 0;
+    loop(NV, (note[v] == m2 && stage[v] == 1) ? (stage[v] = 2); v += 1;);
+  ) : (st == 0xE0) ? (
+    bend = 2 ^ (((m3 * 128 + m2) - 8192) / 8192 * 2 / 12);
+  ) : (st == 0xB0 && (m2 == 120 || m2 == 123)) ? (
+    v = 0;
+    loop(NV, stage[v] = 0; env[v] = 0; v += 1;);
+  );
+);
+
+@sample
+vibPhase += 2 * $pi * 5.5 / srate;
+(vibPhase > 2 * $pi) ? (vibPhase -= 2 * $pi);
+out = 0;
+v = 0;
+loop(NV,
+  stage[v] ? (
+    t = t0[v] / srate;
+    t0[v] += 1;
+    // Envelope: fast attack, then "chop" decay while held, quick release after
+    (stage[v] == 1) ? (
+      env[v] = ((t < 0.006) ? min(1, env[v] + atkInc) : env[v] * kChop);
+    ) : (
+      env[v] *= kRel;
+    );
+    (env[v] < 0.0001 && t > 0.01) ? (stage[v] = 0; env[v] = 0;);
+
+    // Pitch: scoop from -1 semitone, then vibrato fading in after 0.25 s
+    semis = -exp(-t / 0.04) + slider4 * sin(vibPhase) * min(max((t - 0.25) / 0.3, 0), 1);
+    dt = freq[v] * bend * 2 ^ (semis / 12) / srate;
+    x = ph[v] + dt;
+    (x >= 1) ? (x -= 1);
+    ph[v] = x;
+    src = 2 * x - 1;
+    (x < dt) ? (
+      y = x / dt;
+      src -= y + y - y * y - 1;
+    ) : (x > 1 - dt) ? (
+      y = (x - 1) / dt;
+      src -= y * y + y + y + 1;
+    );
+    src += slider5 * (rand(2) - 1);
+
+    vp = vow[v];
+    s = fgain[0] * svfbp(src, formant(vp, 0), fq[0], f1a + 2 * v, f1a + 2 * v + 1)
+      + fgain[1] * svfbp(src, formant(vp, 1), fq[1], f1b + 2 * v, f1b + 2 * v + 1)
+      + fgain[2] * svfbp(src, formant(vp, 2), fq[2], f1c + 2 * v, f1c + 2 * v + 1);
+    out += s * vowelGain(vp) * env[v] * (0.4 + 0.6 * vel[v]);
+  );
+  v += 1;
+);
+// Soft limiter: transparent below about -10 dBFS, never exceeds 0.95
+y = out * gain;
+e = exp(2 * max(min(y, 10), -10));
+spl0 = spl1 = 0.95 * (e - 1) / (e + 1);

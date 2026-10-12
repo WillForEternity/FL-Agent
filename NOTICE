@@ -1,0 +1,30 @@
+FL-Agent
+Copyright 2026 FL-Agent contributors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE), except where a
+file states otherwise.
+
+This repository includes or builds on the following third-party work:
+
+1. fl-studio-mcp (the MCP server in fl-studio-mcp/)
+   Copyright (c) 2025 calvinw; Copyright (c) 2025 Karl Andres
+   MIT License: fl-studio-mcp/LICENSE
+   Source: https://github.com/karl-andres/fl-studio-mcp (commit 202b7a28)
+   Files from upstream remain under the MIT License and have been modified by
+   FL-Agent. Files added by FL-Agent carry an "SPDX-License-Identifier:
+   Apache-2.0" header. Upstream installers and demo media were removed.
+
+2. ysfx (the FL-Agent FX / FL-Agent instrument plugins and flagent_render)
+   Copyright Jean Pierre Cimalando, Joep Vanlier and contributors
+   Apache License 2.0
+   Source: https://github.com/JoepVanlier/ysfx (commit 5c3452fe)
+   Not stored in this repository: scripts/build-plugins.sh fetches it into
+   vendor/ysfx and applies FL-Agent's changes from patches/ysfx-flagent.patch
+   (modified sections are marked "FL-Agent"). ysfx and its build fetch further
+   components under their own licences, including WDL/EEL2 (zlib-style),
+   JUCE (AGPLv3 or commercial; see https://juce.com/legal) and
+   clap-juce-extensions (MIT). Distributing built plugin binaries is subject to
+   those licences, notably JUCE's.
+
+FL Studio is a trademark of Image-Line Software. FL-Agent is not affiliated with
+or endorsed by Image-Line.

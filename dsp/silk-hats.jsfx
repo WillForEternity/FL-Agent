@@ -1,0 +1,74 @@
+desc:Silk Hats - synthesized hi-hats (closed below D4, open from D4 up)
+// SPDX-License-Identifier: Apache-2.0
+// TR-808 style metal: six square waves at 205.3, 304.4, 369.6, 522.7, 540 and
+// 800 Hz (times Tune), mixed with white noise, then a high-pass state-variable
+// filter (~7 kHz). Decay is exponential; notes from D4 (62) up play an open hat
+// (6x longer). A closed hat chokes a ringing open one, like a real kit.
+// Velocity scales level. Width blends shared and per-side noise (0 = mono).
+slider1:1<0.5,2,0.01>Tune
+slider2:0.045<0.01,0.3,0.001>Closed decay (s)
+slider3:0.5<0,1,0.01>Metal vs noise
+slider4:7000<2000,14000,10>High-pass (Hz)
+slider5:0.6<0,1,0.01>Volume
+slider6:0.4<0,1,0.01>Width
+
+@init
+t = 1000;
+amp = 0;
+decay = 0.045;
+fr = 0; fr[0] = 205.3; fr[1] = 304.4; fr[2] = 369.6; fr[3] = 522.7; fr[4] = 540; fr[5] = 800;
+ph = 10;
+hs = 20;   // high-pass states L1 L2 R1 R2
+
+function hp(x, st1, st2) local(v1, v2, v3) (
+  v3 = x - st2[];
+  v1 = a1 * st1[] + a2 * v3;
+  v2 = st2[] + a2 * st1[] + a3 * v3;
+  st1[] = 2 * v1 - st1[];
+  st2[] = 2 * v2 - st2[];
+  x - kq * v1 - v2;
+);
+
+@slider
+g = tan($pi * min(slider4, 0.45 * srate) / srate);
+kq = 1.2;
+a1 = 1 / (1 + g * (g + kq));
+a2 = g * a1;
+a3 = g * a2;
+
+@block
+while (midirecv(ofs, m1, m2, m3)) (
+  ((m1 & 0xF0) == 0x90 && m3 > 0) ? (
+    t = 0;
+    amp = m3 / 127;
+    decay = ((m2 >= 62) ? slider2 * 6 : slider2);
+  );
+);
+
+@sample
+(t < 3) ? (
+  metal = 0;
+  k = 0;
+  loop(6,
+    ph[k] += fr[k] * slider1 / srate;
+    (ph[k] >= 1) ? (ph[k] -= 1);
+    metal += ((ph[k] < 0.5) ? 1 : -1);
+    k += 1;
+  );
+  metal /= 6;
+  nL = rand(2) - 1;
+  nR = rand(2) - 1;
+  nC = 0.5 * (nL + nR);
+  nL = nC + slider6 * (nL - nC);
+  nR = nC + slider6 * (nR - nC);
+  envh = exp(-t / decay) * amp;
+  xL = (slider3 * metal + (1 - slider3) * nL) * envh;
+  xR = (slider3 * metal + (1 - slider3) * nR) * envh;
+  yL = hp(xL, hs, hs + 1);
+  yR = hp(xR, hs + 2, hs + 3);
+  t += 1 / srate;
+) : (
+  yL = yR = 0;
+);
+spl0 = yL * slider5 * 2.0;
+spl1 = yR * slider5 * 2.0;

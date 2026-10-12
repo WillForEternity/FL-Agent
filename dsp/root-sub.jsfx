@@ -1,0 +1,88 @@
+desc:Root Sub - mono sine sub bass with glide and soft harmonics
+// SPDX-License-Identifier: Apache-2.0
+// Last-note-priority mono synth: releasing a key falls back to the previous
+// held key, and legato notes glide instead of retriggering.
+// The glide is exponential in pitch (a one-pole on log2 frequency), so every
+// interval takes the same time.
+// Drive shapes the sine with y = tanh(k x) / tanh(k): odd harmonics make the sub
+// audible on laptop speakers while the fundamental keeps the weight.
+// Output is mono (identical channels), as low end should be.
+slider1:0<-2,1,1>Octave
+slider2:0.06<0,0.5,0.001>Glide (s)
+slider3:1.5<0,6,0.1>Drive
+slider4:0.004<0.001,0.2,0.001>Attack (s)
+slider5:0.12<0.01,2,0.01>Release (s)
+slider6:0.7<0,1,0.01>Volume
+
+@init
+stack = 0;          // held notes, oldest first
+depth = 0;
+amp = 0;
+gate = 0;
+phase = 0;
+logf = log(55) / log(2);
+targetLogf = logf;
+bend = 0;           // semitones
+velGain = 1;
+
+function tanh_(x) local(e) (
+  e = exp(2 * max(min(x, 20), -20));
+  (e - 1) / (e + 1);
+);
+
+function setTarget(n) (
+  targetLogf = log(440 * 2 ^ ((n - 69 + 12 * slider1 + bend) / 12)) / log(2);
+);
+
+@slider
+kGlide = ((slider2 > 0) ? exp(-1 / (slider2 * srate)) : 0);
+atkInc = 1 / (slider4 * srate);
+kRel = exp(-1 / (slider5 * srate));
+drive = max(slider3, 0.001);
+norm = 1 / tanh_(drive);
+(depth > 0) ? setTarget(stack[depth - 1]);
+
+@block
+while (midirecv(ofs, m1, m2, m3)) (
+  st = m1 & 0xF0;
+  (st == 0x90 && m3 > 0) ? (
+    // Move the note to the top of the stack
+    j = 0;
+    while (j < depth) (
+      (stack[j] == m2) ? (
+        memcpy(stack + j, stack + j + 1, depth - j - 1);
+        depth -= 1;
+      ) : (j += 1);
+    );
+    (depth < 32) ? (stack[depth] = m2; depth += 1;);
+    legato = gate;
+    setTarget(m2);
+    legato ? 0 : (logf = targetLogf);   // first note starts on pitch
+    gate = 1;
+    velGain = 0.5 + 0.5 * (m3 / 127);
+  ) : (st == 0x80 || st == 0x90) ? (
+    j = 0;
+    while (j < depth) (
+      (stack[j] == m2) ? (
+        memcpy(stack + j, stack + j + 1, depth - j - 1);
+        depth -= 1;
+      ) : (j += 1);
+    );
+    (depth > 0) ? setTarget(stack[depth - 1]) : (gate = 0);
+  ) : (st == 0xE0) ? (
+    bend = ((m3 * 128 + m2) - 8192) / 8192 * 2;
+    (depth > 0) ? setTarget(stack[depth - 1]);
+  ) : (st == 0xB0 && (m2 == 120 || m2 == 123)) ? (
+    depth = 0;
+    gate = 0;
+    amp = 0;
+  );
+);
+
+@sample
+logf = targetLogf + (logf - targetLogf) * kGlide;
+gate ? (amp = min(1, amp + atkInc)) : (amp *= kRel);
+phase += 2 * $pi * 2 ^ logf / srate;
+(phase > 2 * $pi) ? (phase -= 2 * $pi);
+y = tanh_(drive * sin(phase)) * norm * amp * velGain * slider6 * 0.5;
+spl0 = spl1 = y;

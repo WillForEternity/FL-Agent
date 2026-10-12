@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./scripts/build-plugins.sh)",
+      "Bash(./scripts/build-plugins.sh *)"
+    ]
+  }
+}

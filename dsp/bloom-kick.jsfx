@@ -1,0 +1,50 @@
+desc:Bloom Kick - synthesized punchy kick
+// SPDX-License-Identifier: Apache-2.0
+// A sine whose pitch falls exponentially from Punch x Tune to Tune:
+//   f(t) = tune * (1 + (punch - 1) * e^(-t / pitchDecay))
+// with the phase integrated sample by sample (no clicks from jumps). Amplitude
+// decays as e^(-t / decay); a 3 ms high-passed noise click adds beater attack.
+// Drive soft-clips with tanh for weight. Mono. Any note triggers; velocity
+// scales level.
+slider1:50<30,90,0.5>Tune (Hz)
+slider2:4<1,10,0.1>Punch (start pitch x Tune)
+slider3:0.035<0.005,0.2,0.001>Pitch decay (s)
+slider4:0.32<0.05,1.5,0.01>Decay (s)
+slider5:0.25<0,1,0.01>Click
+slider6:1.6<0.5,6,0.1>Drive
+slider7:0.7<0,1,0.01>Volume
+
+@init
+t = 1000;           // seconds since trigger (starts "finished")
+phase = 0;
+amp = 0;
+hpState = 0;
+lastNoise = 0;
+
+@block
+while (midirecv(ofs, m1, m2, m3)) (
+  ((m1 & 0xF0) == 0x90 && m3 > 0) ? (
+    t = 0;
+    phase = 0;
+    amp = m3 / 127;
+  );
+);
+
+@sample
+(t < 3) ? (
+  f = slider1 * (1 + (slider2 - 1) * exp(-t / slider3));
+  phase += 2 * $pi * f / srate;
+  (phase > 2 * $pi) ? (phase -= 2 * $pi);
+  body = sin(phase) * exp(-t / slider4);
+  // Click: first-difference (high-passed) noise, 3 ms
+  nz = rand(2) - 1;
+  click = ((t < 0.003) ? (nz - lastNoise) * 0.5 * (1 - t / 0.003) : 0);
+  lastNoise = nz;
+  x = slider6 * (body + slider5 * click) * amp;
+  e = exp(2 * max(min(x, 10), -10));
+  y = (e - 1) / (e + 1) / ((exp(2 * slider6) - 1) / (exp(2 * slider6) + 1));
+  t += 1 / srate;
+) : (
+  y = 0;
+);
+spl0 = spl1 = y * slider7 * 0.9;

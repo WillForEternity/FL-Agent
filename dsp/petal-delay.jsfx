@@ -1,0 +1,67 @@
+desc:Petal Delay - wow-modulated ping-pong delay with darkening, softly saturated repeats
+// SPDX-License-Identifier: Apache-2.0
+// Each repeat passes through a one-pole lowpass (coefficient c = e^(-2*pi*fc/fs)),
+// so the n-th echo is filtered n times: repeats lose brightness as they fade.
+// Two delay lines read at times modulated by sines 90 degrees apart (tape "wow").
+slider1:380<10,2000,1>Time (ms)
+slider2:0.55<0,0.95,0.01>Feedback
+slider3:2.5<0,15,0.1>Wow depth (ms)
+slider4:0.35<0.05,5,0.01>Wow rate (Hz)
+slider5:3500<500,16000,10>Tone (Hz)
+slider6:0.35<0,1,0.01>Mix
+slider7:1<0,1,0.01>Ping-pong width
+
+@init
+len = ceil(srate * 2.5);
+bufL = 0;
+bufR = len;
+memset(0, 0, 2 * len);
+wp = 0;
+phase = 0;
+lpL = lpR = 0;
+
+// Linearly interpolated read, d samples behind the write head
+function tap(buf, d) local(pos, i, f, a, b)
+(
+  pos = wp - d;
+  pos < 0 ? (pos += len);
+  i = floor(pos);
+  f = pos - i;
+  a = buf[i];
+  b = buf[(i + 1) % len];
+  a + (b - a) * f;
+);
+
+@slider
+fb = slider2;
+coef = exp(-2 * $pi * slider5 / srate);
+mix = slider6;
+width = slider7;
+
+@sample
+phase += 2 * $pi * slider4 / srate;
+phase > 2 * $pi ? (phase -= 2 * $pi);
+
+base = slider1 * 0.001 * srate;
+wow = slider3 * 0.001 * srate;
+yL = tap(bufL, max(1, base + wow * (0.5 + 0.5 * sin(phase))));
+yR = tap(bufR, max(1, base + wow * (0.5 + 0.5 * cos(phase))));
+
+lpL = yL + (lpL - yL) * coef;
+lpR = yR + (lpR - yR) * coef;
+
+// width = 1: input enters the left line and echoes alternate sides
+mono = 0.5 * (spl0 + spl1);
+inL = (1 - width) * spl0 + width * mono;
+inR = (1 - width) * spl1;
+fL = inL + fb * (width * lpR + (1 - width) * lpL);
+fR = inR + fb * (width * lpL + (1 - width) * lpR);
+
+// x / (1 + k|x|): unity slope at zero, gently compresses loud repeats
+bufL[wp] = fL / (1 + 0.3 * abs(fL));
+bufR[wp] = fR / (1 + 0.3 * abs(fR));
+wp += 1;
+wp >= len ? (wp = 0);
+
+spl0 = spl0 * (1 - mix) + lpL * mix;
+spl1 = spl1 * (1 - mix) + lpR * mix;

@@ -1,0 +1,63 @@
+desc:Wind Riser - noise sweep for build-ups (hold a key)
+// SPDX-License-Identifier: Apache-2.0
+// While a key is held, stereo noise runs through a band-pass whose centre rises
+// exponentially from 200 Hz to "Top" over "Length" beats at the host tempo:
+//   fc(b) = 200 * (top / 200)^(min(b / length, 1)^curve)
+// Level rises with the sweep; releasing the key fades it out over "Fade".
+// The note number shifts the start: higher keys start higher.
+slider1:8<1,32,1>Length (beats)
+slider2:12000<2000,18000,10>Top (Hz)
+slider3:1.5<0.5,4,0.1>Curve
+slider4:0.6<0.05,4,0.01>Fade (s)
+slider5:0.5<0,1,0.01>Volume
+
+@init
+beats = 0;
+gate = 0;
+level = 0;
+startHz = 200;
+st = 0;    // filter states L1 L2 R1 R2 in memory 0-3
+
+function bp(x, s1, s2) local(v1, v2, v3) (
+  v3 = x - s2[];
+  v1 = a1 * s1[] + a2 * v3;
+  v2 = s2[] + a2 * s1[] + a3 * v3;
+  s1[] = 2 * v1 - s1[];
+  s2[] = 2 * v2 - s2[];
+  v1 * kq;
+);
+
+@slider
+kFade = exp(-1 / (slider4 * srate));
+kq = 1 / 2.5;
+
+@block
+while (midirecv(ofs, m1, m2, m3)) (
+  stat = m1 & 0xF0;
+  (stat == 0x90 && m3 > 0) ? (
+    gate = 1;
+    beats = 0;
+    startHz = 200 * 2 ^ ((m2 - 60) / 24);
+  ) : (stat == 0x80 || stat == 0x90) ? (
+    gate = 0;
+  );
+);
+bps = tempo / 60;
+
+@sample
+(gate || level > 0.0001) ? (
+  gate ? (beats += bps / srate);
+  pr = min(beats / slider1, 1) ^ slider3;
+  fc = min(startHz * (slider2 / startHz) ^ pr, 0.45 * srate);
+  g = tan($pi * fc / srate);
+  a1 = 1 / (1 + g * (g + kq));
+  a2 = g * a1;
+  a3 = g * a2;
+  level = (gate ? 0.15 + 0.85 * pr : level * kFade);
+  yL = bp(rand(2) - 1, 0, 1) * level;
+  yR = bp(rand(2) - 1, 2, 3) * level;
+) : (
+  yL = yR = 0;
+);
+spl0 = yL * slider5 * 1.6;
+spl1 = yR * slider5 * 1.6;

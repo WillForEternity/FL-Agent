@@ -1,0 +1,112 @@
+desc:Glass Bloom - 8-voice FM bell with inharmonic ratio and blooming brightness
+// SPDX-License-Identifier: Apache-2.0
+// Two-operator FM: y = sin(wc*t + I(t) * sin(r*wc*t)).
+// A non-integer ratio r (default 3.5) puts sidebands at wc*(1 +/- k*r), which
+// are not harmonics of wc, so the tone reads as a bell or glass.
+// The index I(t) = I0 * (0.2 + 0.8 * e^(-t/Tb)) decays faster than the
+// amplitude e^(-t/Td): a bright strike that mellows into a pure tail.
+// Left and right carriers are detuned +/- c cents for a slow stereo shimmer.
+// A pure sine one octave below (no FM) adds warmth under the bell.
+slider1:3.5<0.5,8,0.01>Mod ratio
+slider2:4<0,12,0.1>Brightness (FM index)
+slider3:2.5<0.1,10,0.1>Decay (s)
+slider4:0.4<0.05,3,0.01>Bright decay (s)
+slider5:6<0,30,0.1>Stereo detune (cents)
+slider6:0.5<0,1,0.01>Volume
+slider7:0.3<0,1,0.01>Sub octave
+
+@init
+NV = 8;
+note = 1000;
+vel = note + 16;
+env = vel + 16;
+atk = env + 16;
+bright = atk + 16;
+rel = bright + 16;
+incL = rel + 16;
+incR = incL + 16;
+pcL = incR + 16;
+pmL = pcL + 16;
+pcR = pmL + 16;
+pmR = pcR + 16;
+ps = pmR + 16;
+v = 0;
+loop(NV, note[v] = -1; env[v] = 0; v += 1;);
+twopi = 2 * $pi;
+atkInc = 1 / (0.002 * srate);
+
+@slider
+ratio = slider1;
+index = slider2;
+kDecay = exp(-1 / (slider3 * srate));
+kBright = exp(-1 / (slider4 * srate));
+kRel = exp(-1 / (0.3 * srate));
+detL = 2 ^ (-slider5 / 1200);
+detR = 2 ^ (slider5 / 1200);
+vol = slider6;
+sub = slider7;
+
+@block
+while (midirecv(ofs, m1, m2, m3)) (
+  st = m1 & 0xF0;
+  (st == 0x90 && m3 > 0) ? (
+    // Reuse a free voice, otherwise steal the quietest one
+    best = 0;
+    bestLevel = 10;
+    v = 0;
+    loop(NV,
+      level = (note[v] < 0 ? -1 : env[v]);
+      level < bestLevel ? (bestLevel = level; best = v;);
+      v += 1;
+    );
+    note[best] = m2;
+    vel[best] = (m3 / 127) ^ 1.5;
+    env[best] = 1;
+    atk[best] = 0;
+    bright[best] = 1;
+    rel[best] = 0;
+    pcL[best] = pmL[best] = pcR[best] = pmR[best] = ps[best] = 0;
+    f = 440 * 2 ^ ((m2 - 69) / 12);
+    incL[best] = twopi * f * detL / srate;
+    incR[best] = twopi * f * detR / srate;
+  ) : (st == 0x80 || st == 0x90) ? (
+    v = 0;
+    loop(NV, note[v] == m2 ? (rel[v] = 1); v += 1;);
+  ) : (st == 0xB0 && (m2 == 120 || m2 == 123)) ? (
+    v = 0;
+    loop(NV, note[v] = -1; env[v] = 0; v += 1;);
+  );
+);
+
+@sample
+outL = outR = 0;
+v = 0;
+loop(NV,
+  note[v] >= 0 ? (
+    atk[v] < 1 ? (atk[v] = min(1, atk[v] + atkInc));
+    env[v] *= (rel[v] ? kRel : kDecay);
+    bright[v] *= kBright;
+    a = atk[v] * env[v] * vel[v];
+    I = index * (0.2 + 0.8 * bright[v]);
+
+    pcL[v] += incL[v];
+    pmL[v] += incL[v] * ratio;
+    pcR[v] += incR[v];
+    pmR[v] += incR[v] * ratio;
+    ps[v] += 0.25 * (incL[v] + incR[v]);
+    pcL[v] -= twopi * floor(pcL[v] / twopi);
+    pmL[v] -= twopi * floor(pmL[v] / twopi);
+    pcR[v] -= twopi * floor(pcR[v] / twopi);
+    pmR[v] -= twopi * floor(pmR[v] / twopi);
+    ps[v] -= twopi * floor(ps[v] / twopi);
+
+    s = a * sub * sin(ps[v]);
+    outL += a * sin(pcL[v] + I * sin(pmL[v])) + s;
+    outR += a * sin(pcR[v] + I * sin(pmR[v])) + s;
+
+    env[v] < 0.0001 ? (note[v] = -1);
+  );
+  v += 1;
+);
+spl0 = outL * vol * 0.25;
+spl1 = outR * vol * 0.25;

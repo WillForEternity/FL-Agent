@@ -1,0 +1,78 @@
+desc:Snap Clap - synthesized clap / snare layer
+// SPDX-License-Identifier: Apache-2.0
+// Clap: noise through a band-pass (state-variable, ~1.4 kHz) with the classic
+// multi-burst envelope: three 9 ms-spaced bursts (each decaying in 4 ms), then a
+// diffuse tail decaying with "Tail". Left and right use independent noise,
+// blended by Width, for a wide clap that still sums to mono.
+// Body: a 190 Hz sine with a fast decay, for a snare-like thump under the clap.
+// Any note triggers; velocity scales level.
+slider1:1400<500,4000,10>Tone (Hz)
+slider2:0.16<0.03,0.8,0.01>Tail (s)
+slider3:0.35<0,1,0.01>Body
+slider4:0.6<0,1,0.01>Width
+slider5:0.7<0,1,0.01>Volume
+
+@init
+t = 1000;
+amp = 0;
+bodyPhase = 0;
+sL1 = sL2 = sR1 = sR2 = 0;
+
+function bp(x, st1, st2) local(v1, v2, v3) (
+  v3 = x - st2[];
+  v1 = a1 * st1[] + a2 * v3;
+  v2 = st2[] + a2 * st1[] + a3 * v3;
+  st1[] = 2 * v1 - st1[];
+  st2[] = 2 * v2 - st2[];
+  v1 * kq;
+);
+
+@slider
+g = tan($pi * slider1 / srate);
+kq = 1 / 1.6;
+a1 = 1 / (1 + g * (g + kq));
+a2 = g * a1;
+a3 = g * a2;
+mem = 10;   // filter states in memory 10-13
+
+@block
+while (midirecv(ofs, m1, m2, m3)) (
+  ((m1 & 0xF0) == 0x90 && m3 > 0) ? (
+    t = 0;
+    amp = m3 / 127;
+    bodyPhase = 0;
+  );
+);
+
+@sample
+(t < 3) ? (
+  // Burst envelope: max of three spaced bursts, then the tail
+  b = 0;
+  k = 0;
+  loop(3,
+    tb = t - k * 0.009;
+    (tb >= 0) ? (b = max(b, exp(-tb / 0.004)));
+    k += 1;
+  );
+  tail = ((t >= 0.018) ? 0.7 * exp(-(t - 0.018) / slider2) : 0);
+  envc = max(b, tail);
+
+  nL = rand(2) - 1;
+  nR = rand(2) - 1;
+  nC = 0.5 * (nL + nR);
+  inL = nC + slider4 * (nL - nC);
+  inR = nC + slider4 * (nR - nC);
+  cL = bp(inL, mem, mem + 1) * envc;
+  cR = bp(inR, mem + 2, mem + 3) * envc;
+
+  bodyPhase += 2 * $pi * 190 / srate;
+  body = slider3 * sin(bodyPhase) * exp(-t / 0.05);
+
+  yL = (cL * 2.2 + body) * amp;
+  yR = (cR * 2.2 + body) * amp;
+  t += 1 / srate;
+) : (
+  yL = yR = 0;
+);
+spl0 = yL * slider5;
+spl1 = yR * slider5;

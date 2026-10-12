@@ -1,0 +1,494 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cd3f653..e2f4b0e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -76,6 +76,10 @@ endif()
+ if(YSFX_PLUGIN)
+     include("cmake.plugin.txt")
+ endif()
++# FL-Agent: offline renderer used to check JSFX scripts before they're loaded in FL
++add_executable(flagent_render "tools/flagent_render.cpp")
++target_link_libraries(flagent_render PRIVATE ysfx::ysfx)
++
+ if(YSFX_TOOLS)
+     include("cmake.tools.txt")
+ endif()
+diff --git a/cmake.plugin.txt b/cmake.plugin.txt
+index 259fe8c..b4167ef 100644
+--- a/cmake.plugin.txt
++++ b/cmake.plugin.txt
+@@ -57,13 +57,13 @@ function(add_new_target target_name is_synth)
+     endif()
+ 
+     juce_add_plugin("${target_name}"
+-        PLUGIN_CODE "ysf${CODE_END}"
+-        PLUGIN_MANUFACTURER_CODE "S4IK"
+-        PRODUCT_NAME "ysfx-s${SUFFIX}"
+-        JUCE_PLUGIN_NAME "ysfx-s${SUFFIX}"
+-        JUCE_DESCRIPTION "Host for JSFX plugins"
+-        COMPANY_NAME "Jean Pierre Cimalando / Joep Vanlier"
+-        BUNDLE_ID "Jean_Pierre_Cimalando__Joep_Vanlier"
++        PLUGIN_CODE "Agt${CODE_END}"
++        PLUGIN_MANUFACTURER_CODE "FLAg"
++        PRODUCT_NAME "FL-Agent${SUFFIX}"
++        JUCE_PLUGIN_NAME "FL-Agent${SUFFIX}"
++        JUCE_DESCRIPTION "FL-Agent JSFX host (modified ysfx)"
++        COMPANY_NAME "FL-Agent"
++        BUNDLE_ID "local.flagent.ysfx"
+         FORMATS VST3 AU
+         NEEDS_MIDI_INPUT TRUE
+         NEEDS_MIDI_OUTPUT TRUE
+@@ -147,8 +147,8 @@ function(add_new_target target_name is_synth)
+ 
+     clap_juce_extensions_plugin(
+         TARGET "${target_name}"
+-        PLUGIN_NAME "ysfx-s${SUFFIX}"
+-        CLAP_ID "org.saike.ysfx-s${CLAP_SUFFIX}"
++        PLUGIN_NAME "FL-Agent${SUFFIX}"
++        CLAP_ID "local.flagent.ysfx${CLAP_SUFFIX}"
+         CLAP_FEATURES "${CLAP_TYPE}"
+         CLAP_PROCESS_EVENTS_RESOLUTION_SAMPLES 64
+         CLAP_USE_JUCE_PARAMETER_RANGES DISCRETE
+diff --git a/plugin/processor.cpp b/plugin/processor.cpp
+index f9f1b1e..2a2fa3b 100644
+--- a/plugin/processor.cpp
++++ b/plugin/processor.cpp
+@@ -177,6 +177,112 @@ struct YsfxProcessor::Impl : public juce::AudioProcessorListener {
+     juce::CriticalSection m_loadLock;
+     juce::String m_lastLoadPath{""};
+     ysfx_state_u m_failedLoadState{nullptr};  // Holds the state of a failed load
++
++    // FL-Agent: watches the loaded script and reloads it when the file changes
++    std::unique_ptr<juce::Timer> m_agentWatcher;
++    bool m_agentClaimed{false};
++    juce::AudioParameterFloat *m_agentAssignParam{nullptr};
++};
++
++//==============================================================================
++// FL-Agent modifications (not part of upstream ysfx):
++// - A new instance loads the script named in pending.txt, if FL-Agent wrote one
++//   in the last 30 seconds. This lets an external tool choose which script a
++//   freshly created plugin runs without using the GUI.
++// - The loaded script is reloaded (keeping slider values) whenever its file
++//   changes on disk.
++// - An extra host parameter, "FL-Agent assign", lets a tool point one specific
++//   instance at a script: it writes the script path to assign-<token>.txt and
++//   sets the parameter to token / 1e6. The instance loads the script and resets
++//   the parameter to 0.
++static juce::File agentPendingFile()
++{
++    return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
++        .getChildFile("Application Support/FL-Agent/ysfx/pending.txt");
++}
++
++static juce::String agentClaimPendingScript()
++{
++    juce::File pending = agentPendingFile();
++    if (!pending.existsAsFile())
++        return {};
++
++    bool fresh = (juce::Time::getCurrentTime() - pending.getLastModificationTime()).inSeconds() < 30;
++    juce::File claimed = pending.getSiblingFile("claimed-" + juce::String::toHexString(juce::Random::getSystemRandom().nextInt64()));
++    if (!pending.moveFileTo(claimed))
++        return {};  // another instance claimed it first
++
++    juce::String path = claimed.loadFileAsString().trim();
++    claimed.deleteFile();
++    return fresh ? path : juce::String{};
++}
++
++// Tokens are encoded in the assign parameter as token / kAgentTokenScale
++static constexpr double kAgentTokenScale = 1e6;
++
++class AgentScriptWatcher : public juce::Timer {
++public:
++    AgentScriptWatcher(YsfxProcessor &processor, juce::AudioParameterFloat *assignParam)
++        : m_processor{processor}, m_assignParam{assignParam} { startTimer(250); }
++
++    void timerCallback() override
++    {
++        checkAssignment();
++        checkFileChanged();
++    }
++
++private:
++    void checkAssignment()
++    {
++        float value = m_assignParam ? m_assignParam->get() : 0.0f;
++        if (value <= 0.0f) {
++            m_assignWaits = 0;
++            return;
++        }
++
++        int token = juce::roundToInt(value * kAgentTokenScale);
++        juce::File request = agentPendingFile().getSiblingFile("assign-" + juce::String(token) + ".txt");
++        if (request.existsAsFile()) {
++            juce::String path = request.loadFileAsString().trim();
++            request.deleteFile();
++            if (path.isNotEmpty())
++                m_processor.loadJsfxFile(path, nullptr, true, false);
++        }
++        else if (++m_assignWaits < 20) {
++            return;  // give the request file up to ~5 s to appear
++        }
++
++        m_assignWaits = 0;
++        m_assignParam->setValueNotifyingHost(0.0f);
++    }
++
++    void checkFileChanged()
++    {
++        YsfxInfo::Ptr info = m_processor.getCurrentInfo();
++        if (!info || !info->effect)
++            return;
++
++        juce::File file{juce::CharPointer_UTF8{ysfx_get_file_path(info->effect.get())}};
++        if (file.getFullPathName().isEmpty() || !file.existsAsFile())
++            return;
++
++        juce::Time modified = file.getLastModificationTime();
++        if (file != m_file) {
++            m_file = file;
++            m_modified = modified;
++            return;
++        }
++        if (modified != m_modified) {
++            m_modified = modified;
++            m_processor.loadJsfxFile(file.getFullPathName(), nullptr, true, true);
++        }
++    }
++
++    YsfxProcessor &m_processor;
++    juce::AudioParameterFloat *m_assignParam = nullptr;
++    int m_assignWaits = 0;
++    juce::File m_file;
++    juce::Time m_modified;
+ };
+ 
+ //==============================================================================
+@@ -242,6 +348,11 @@ YsfxProcessor::YsfxProcessor()
+     for (int i = 0; i < ysfx_max_sliders; ++i)
+         addParameter(new YsfxParameter(fx, i));
+ 
++    // FL-Agent: comes after the sliders so slider parameter indices are unchanged
++    m_impl->m_agentAssignParam = new juce::AudioParameterFloat(
++        juce::ParameterID{"flagent_assign", 1}, "FL-Agent assign", 0.0f, 1.0f, 0.0f);
++    addParameter(m_impl->m_agentAssignParam);
++
+     ///
+     m_impl->m_sliderNotificationUpdater.reset(new Impl::SliderNotificationUpdater{m_impl.get()});
+ 
+@@ -256,6 +367,14 @@ YsfxProcessor::YsfxProcessor()
+ 
+     ///
+     addListener(m_impl.get());
++
++    ///
++    juce::String agentScript = agentClaimPendingScript();
++    if (agentScript.isNotEmpty()) {
++        m_impl->m_agentClaimed = true;
++        loadJsfxFile(agentScript, nullptr, true, false);
++    }
++    m_impl->m_agentWatcher.reset(new AgentScriptWatcher(*this, m_impl->m_agentAssignParam));
+ }
+ 
+ juce::String YsfxProcessor::lastLoadPath()
+@@ -277,6 +396,7 @@ RetryState YsfxProcessor::retryLoad()
+ 
+ YsfxProcessor::~YsfxProcessor()
+ {
++    m_impl->m_agentWatcher.reset();
+     removeListener(m_impl.get());
+     m_impl->m_background->shutdown();
+ }
+@@ -718,6 +838,8 @@ void YsfxProcessor::setStateInformation(const void *data, int sizeInBytes)
+         return;
+ 
+     path = root.getProperty("path").toString();
++    if (m_impl->m_agentClaimed && root.getProperty("path").toString().isEmpty())
++        return;
+ 
+     juce::ValueTree stateTree = root.getChildWithName("state");
+     if (stateTree != juce::ValueTree{}) {
+diff --git a/tools/flagent_render.cpp b/tools/flagent_render.cpp
+new file mode 100644
+index 0000000..a40e52d
+--- /dev/null
++++ b/tools/flagent_render.cpp
+@@ -0,0 +1,276 @@
++// FL-Agent offline JSFX renderer and checker (not part of upstream ysfx).
++//
++// Renders a JSFX script without a DAW and reports whether it compiles, its
++// sliders, and level statistics, so effects and instruments can be checked
++// before anyone hears them.
++//
++// Usage:
++//   flagent_render SCRIPT [options]
++//     --seconds S        total render length (default 4)
++//     --notes N,N,...    MIDI notes to play at t=0 (instrument test)
++//     --velocity V       note-on velocity (default 100)
++//     --hold S           seconds before note-offs (default 1.5)
++//     --input KIND       audio fed to the script: none|noise|sine|pluck (default none)
++//     --input-seconds S  how long the input lasts (default 0.5)
++//     --tempo BPM        host tempo, playing from beat 0 (default 120)
++//     --slider I=V       set slider I (1-based, as in the script) before rendering
++//     --wav PATH         also write a 32-bit float stereo WAV
++//     --rate HZ          sample rate (default 48000)
++//
++// Prints one JSON object. Exit code: 0 ok, 1 usage error, 2 compile/load error.
++
++#include "ysfx.h"
++
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <string>
++#include <vector>
++
++namespace {
++
++struct Options {
++    std::string script;
++    double seconds = 4.0;
++    std::vector<int> notes;
++    int velocity = 100;
++    double hold = 1.5;
++    std::string input = "none";
++    double inputSeconds = 0.5;
++    double tempo = 120.0;
++    std::vector<std::pair<int, double>> sliders;
++    std::string wav;
++    double rate = 48000.0;
++};
++
++std::string g_log;
++
++void logReporter(intptr_t, ysfx_log_level level, const char *message)
++{
++    g_log += (level == ysfx_log_error) ? "error: " : (level == ysfx_log_warning) ? "warning: " : "";
++    g_log += message;
++    g_log += "\n";
++}
++
++std::string jsonEscape(const std::string &s)
++{
++    std::string out;
++    for (char c : s) {
++        switch (c) {
++        case '"': out += "\\\""; break;
++        case '\\': out += "\\\\"; break;
++        case '\n': out += "\\n"; break;
++        case '\t': out += "\\t"; break;
++        default:
++            if ((unsigned char)c < 0x20) {
++                char buf[8];
++                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
++                out += buf;
++            }
++            else {
++                out += c;
++            }
++        }
++    }
++    return out;
++}
++
++double toDb(double x) { return x > 0 ? 20.0 * std::log10(x) : -999.0; }
++
++bool parseArgs(int argc, char *argv[], Options &opt)
++{
++    if (argc < 2)
++        return false;
++    opt.script = argv[1];
++    for (int i = 2; i < argc; ++i) {
++        std::string a = argv[i];
++        auto next = [&]() -> const char * { return (i + 1 < argc) ? argv[++i] : nullptr; };
++        const char *v = nullptr;
++        if (a == "--seconds" && (v = next())) opt.seconds = std::atof(v);
++        else if (a == "--velocity" && (v = next())) opt.velocity = std::atoi(v);
++        else if (a == "--hold" && (v = next())) opt.hold = std::atof(v);
++        else if (a == "--input" && (v = next())) opt.input = v;
++        else if (a == "--input-seconds" && (v = next())) opt.inputSeconds = std::atof(v);
++        else if (a == "--tempo" && (v = next())) opt.tempo = std::atof(v);
++        else if (a == "--wav" && (v = next())) opt.wav = v;
++        else if (a == "--rate" && (v = next())) opt.rate = std::atof(v);
++        else if (a == "--notes" && (v = next())) {
++            std::string s = v;
++            size_t pos = 0;
++            while (pos < s.size()) {
++                size_t comma = s.find(',', pos);
++                opt.notes.push_back(std::atoi(s.substr(pos, comma - pos).c_str()));
++                if (comma == std::string::npos) break;
++                pos = comma + 1;
++            }
++        }
++        else if (a == "--slider" && (v = next())) {
++            const char *eq = std::strchr(v, '=');
++            if (!eq) return false;
++            opt.sliders.emplace_back(std::atoi(v), std::atof(eq + 1));
++        }
++        else return false;
++    }
++    return opt.seconds > 0 && opt.rate > 0;
++}
++
++void writeWav(const std::string &path, const std::vector<float> &l, const std::vector<float> &r, double rate)
++{
++    FILE *f = std::fopen(path.c_str(), "wb");
++    if (!f) return;
++    uint32_t frames = (uint32_t)l.size();
++    uint32_t dataBytes = frames * 2 * 4;
++    auto u32 = [&](uint32_t x) { std::fwrite(&x, 4, 1, f); };
++    auto u16 = [&](uint16_t x) { std::fwrite(&x, 2, 1, f); };
++    std::fwrite("RIFF", 1, 4, f); u32(36 + dataBytes); std::fwrite("WAVE", 1, 4, f);
++    std::fwrite("fmt ", 1, 4, f); u32(16); u16(3); u16(2); u32((uint32_t)rate);
++    u32((uint32_t)rate * 8); u16(8); u16(32);
++    std::fwrite("data", 1, 4, f); u32(dataBytes);
++    for (uint32_t i = 0; i < frames; ++i) {
++        std::fwrite(&l[i], 4, 1, f);
++        std::fwrite(&r[i], 4, 1, f);
++    }
++    std::fclose(f);
++}
++
++} // namespace
++
++int main(int argc, char *argv[])
++{
++    Options opt;
++    if (!parseArgs(argc, argv, opt)) {
++        std::fprintf(stderr, "usage: flagent_render SCRIPT [--notes 60,64,67] [--input noise] "
++                             "[--seconds 4] [--slider 1=0.5] [--wav out.wav] ...\n");
++        return 1;
++    }
++
++    ysfx_config_u config{ysfx_config_new()};
++    ysfx_set_log_reporter(config.get(), &logReporter);
++    ysfx_register_builtin_audio_formats(config.get());
++    ysfx_u fx{ysfx_new(config.get())};
++
++    const uint32_t block = 256;
++    bool ok = ysfx_load_file(fx.get(), opt.script.c_str(), 0) &&
++              ysfx_compile(fx.get(), ysfx_compile_no_gfx);
++    if (!ok) {
++        std::printf("{\"compiled\": false, \"log\": \"%s\"}\n", jsonEscape(g_log).c_str());
++        return 2;
++    }
++    ysfx_set_sample_rate(fx.get(), opt.rate);
++    ysfx_set_block_size(fx.get(), block);
++    ysfx_init(fx.get());
++
++    for (auto &s : opt.sliders)
++        ysfx_slider_set_value(fx.get(), (uint32_t)(s.first - 1), s.second, true);
++
++    // Slider list for the report
++    std::string sliders = "[";
++    for (uint32_t i = 0; i < ysfx_max_sliders; ++i) {
++        if (!ysfx_slider_exists(fx.get(), i)) continue;
++        if (sliders.size() > 1) sliders += ", ";
++        char buf[64];
++        std::snprintf(buf, sizeof(buf), "%g", ysfx_slider_get_value(fx.get(), i));
++        sliders += "{\"index\": " + std::to_string(i + 1) + ", \"name\": \"" +
++                   jsonEscape(ysfx_slider_get_name(fx.get(), i)) + "\", \"value\": " + buf + "}";
++    }
++    sliders += "]";
++
++    const uint64_t total = (uint64_t)(opt.seconds * opt.rate);
++    const uint64_t inputFrames = (uint64_t)(opt.inputSeconds * opt.rate);
++    const uint64_t noteOffFrame = (uint64_t)(opt.hold * opt.rate);
++
++    std::vector<float> outL, outR;
++    outL.reserve(total);
++    outR.reserve(total);
++    std::vector<float> inBufL(block), inBufR(block), outBufL(block), outBufR(block);
++    std::mt19937 rng(1234);
++    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
++
++    bool notesOn = false, notesOff = opt.notes.empty();
++    double inputPhase = 0;
++    for (uint64_t pos = 0; pos < total; pos += block) {
++        uint32_t n = (uint32_t)std::min<uint64_t>(block, total - pos);
++
++        ysfx_time_info_t ti{};
++        ti.tempo = opt.tempo;
++        ti.playback_state = ysfx_playback_playing;
++        ti.time_position = (double)pos / opt.rate;
++        ti.beat_position = ti.time_position * opt.tempo / 60.0;
++        ti.time_signature[0] = 4;
++        ti.time_signature[1] = 4;
++        ysfx_set_time_info(fx.get(), &ti);
++
++        if (!notesOn && !opt.notes.empty()) {
++            for (int note : opt.notes) {
++                uint8_t msg[3] = {0x90, (uint8_t)note, (uint8_t)opt.velocity};
++                ysfx_midi_event_t ev{0, 0, 3, msg};
++                ysfx_send_midi(fx.get(), &ev);
++            }
++            notesOn = true;
++        }
++        if (!notesOff && pos >= noteOffFrame) {
++            for (int note : opt.notes) {
++                uint8_t msg[3] = {0x80, (uint8_t)note, 0};
++                ysfx_midi_event_t ev{0, 0, 3, msg};
++                ysfx_send_midi(fx.get(), &ev);
++            }
++            notesOff = true;
++        }
++
++        for (uint32_t i = 0; i < n; ++i) {
++            float x = 0;
++            uint64_t t = pos + i;
++            if (t < inputFrames) {
++                if (opt.input == "noise") x = 0.3f * uni(rng);
++                else if (opt.input == "sine") x = 0.5f * (float)std::sin(inputPhase);
++                else if (opt.input == "pluck") x = 0.6f * (float)std::sin(inputPhase) * (float)std::exp(-8.0 * t / opt.rate);
++                inputPhase += 2 * M_PI * 440.0 / opt.rate;
++            }
++            inBufL[i] = x;
++            inBufR[i] = x;
++        }
++        const float *ins[2] = {inBufL.data(), inBufR.data()};
++        float *outs[2] = {outBufL.data(), outBufR.data()};
++        ysfx_process_float(fx.get(), ins, outs, 2, 2, n);
++        outL.insert(outL.end(), outBufL.begin(), outBufL.begin() + n);
++        outR.insert(outR.end(), outBufR.begin(), outBufR.begin() + n);
++    }
++
++    // Statistics: whole render, and the last 10% (decay / runaway check)
++    uint64_t nonFinite = 0;
++    double peakL = 0, peakR = 0, sumL = 0, sumR = 0, sumSqL = 0, sumSqR = 0, sumLR = 0;
++    double tailSq = 0;
++    const uint64_t tailStart = total - total / 10;
++    for (uint64_t i = 0; i < total; ++i) {
++        double l = outL[i], r = outR[i];
++        if (!std::isfinite(l) || !std::isfinite(r)) { ++nonFinite; continue; }
++        peakL = std::max(peakL, std::fabs(l));
++        peakR = std::max(peakR, std::fabs(r));
++        sumL += l; sumR += r;
++        sumSqL += l * l; sumSqR += r * r; sumLR += l * r;
++        if (i >= tailStart) tailSq += 0.5 * (l * l + r * r);
++    }
++    double N = (double)total;
++    double rmsL = std::sqrt(sumSqL / N), rmsR = std::sqrt(sumSqR / N);
++    double tailRms = std::sqrt(tailSq / (double)(total - tailStart));
++    double corr = (sumSqL > 0 && sumSqR > 0) ? sumLR / std::sqrt(sumSqL * sumSqR) : 0;
++    double peak = std::max(peakL, peakR);
++
++    if (!opt.wav.empty())
++        writeWav(opt.wav, outL, outR, opt.rate);
++
++    std::printf(
++        "{\"compiled\": true, \"sliders\": %s, \"peak_db\": %.2f, \"peak_l_db\": %.2f, "
++        "\"peak_r_db\": %.2f, \"rms_db\": %.2f, \"tail_rms_db\": %.2f, \"dc_offset\": %.6f, "
++        "\"stereo_correlation\": %.3f, \"non_finite_samples\": %llu, \"clipping\": %s, "
++        "\"silent\": %s, \"log\": \"%s\"}\n",
++        sliders.c_str(), toDb(peak), toDb(peakL), toDb(peakR),
++        toDb(std::sqrt(0.5 * (rmsL * rmsL + rmsR * rmsR))), toDb(tailRms),
++        0.5 * (sumL + sumR) / N, corr, (unsigned long long)nonFinite,
++        peak > 1.0 ? "true" : "false", peak < 1e-5 ? "true" : "false",
++        jsonEscape(g_log).c_str());
++    return 0;
++}

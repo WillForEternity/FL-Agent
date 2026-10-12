@@ -1,0 +1,112 @@
+desc:Moss Verb - lush stereo reverb (Freeverb topology)
+// SPDX-License-Identifier: Apache-2.0
+// Schroeder/Moorer design as in Jezar's Freeverb: per channel, 8 parallel comb
+// filters with one-pole low-passes in their feedback (damping), then 4 series
+// all-pass diffusers. Delay lengths are Freeverb's (scaled to the sample rate);
+// the right channel is offset by 23 samples to decorrelate.
+// Comb feedback = 0.7 + 0.28 * size. A one-pole high-pass on the reverb input
+// (Low cut) keeps the low end clean, and Pre-delay separates the dry hit.
+// The wet signal passes a tanh soft limiter (ceiling 0.9), so extreme settings
+// (huge size, 100% wet, loud sustained input) can't clip; normal use stays linear.
+slider1:0.82<0,1,0.01>Size
+slider2:0.45<0,1,0.01>Damping
+slider3:1<0,1,0.01>Width
+slider4:0.3<0,1,0.01>Mix
+slider5:20<0,200,1>Pre-delay (ms)
+slider6:180<20,1000,1>Low cut (Hz)
+
+@init
+scale = srate / 44100;
+nc = 8;
+na = 4;
+combLen = 0;   // table: 8 comb lengths
+combLen[0] = 1116; combLen[1] = 1188; combLen[2] = 1277; combLen[3] = 1356;
+combLen[4] = 1422; combLen[5] = 1491; combLen[6] = 1557; combLen[7] = 1617;
+apLen = 10;
+apLen[0] = 556; apLen[1] = 441; apLen[2] = 341; apLen[3] = 225;
+spread = 23;
+
+// Per buffer: start offset, length, write index. Tables at 100 (combs L,R) and 140 (allpass L,R)
+cStart = 100; cSize = 116; cPos = 132; cFilt = 148;   // 16 combs (8 L + 8 R)
+aStart = 170; aSize = 178; aPos = 186;               // 8 allpasses (4 L + 4 R)
+next = 1000;
+i = 0;
+loop(16,
+  n = floor((combLen[i % 8] + ((i >= 8) ? spread : 0)) * scale);
+  cStart[i] = next; cSize[i] = n; cPos[i] = 0; cFilt[i] = 0;
+  next += n;
+  i += 1;
+);
+i = 0;
+loop(8,
+  n = floor((apLen[i % 4] + ((i >= 4) ? spread : 0)) * scale);
+  aStart[i] = next; aSize[i] = n; aPos[i] = 0;
+  next += n;
+  i += 1;
+);
+preStart = next;
+preSize = ceil(0.2 * srate) + 1;
+prePos = 0;
+next += preSize;
+memset(1000, 0, next - 1000);
+hpL = hpR = 0;
+
+function comb(x, c) local(addr, o) (
+  addr = cStart[c] + cPos[c];
+  o = addr[];
+  cFilt[c] = o * damp2 + cFilt[c] * damp1;
+  addr[] = x + cFilt[c] * feedback;
+  cPos[c] += 1;
+  (cPos[c] >= cSize[c]) ? (cPos[c] = 0);
+  o;
+);
+
+function allpass(x, a) local(addr, b, o) (
+  addr = aStart[a] + aPos[a];
+  b = addr[];
+  o = b - x;
+  addr[] = x + b * 0.5;
+  aPos[a] += 1;
+  (aPos[a] >= aSize[a]) ? (aPos[a] = 0);
+  o;
+);
+
+@slider
+feedback = 0.7 + 0.28 * slider1;
+damp1 = slider2 * 0.4;
+damp2 = 1 - damp1;
+wet1 = slider3 / 2 + 0.5;
+wet2 = (1 - slider3) / 2;
+preDelay = min(floor(slider5 * 0.001 * srate), preSize - 1);
+kHp = exp(-2 * $pi * slider6 / srate);
+
+@sample
+dryL = spl0;
+dryR = spl1;
+
+// Pre-delay (mono sum feeds the tank, as in Freeverb)
+preStart[prePos] = 0.5 * (dryL + dryR);
+rd = prePos - preDelay;
+(rd < 0) ? (rd += preSize);
+x = preStart[rd];
+prePos += 1;
+(prePos >= preSize) ? (prePos = 0);
+
+// Low cut: x minus its one-pole low-passed self
+hpL = x + (hpL - x) * kHp;
+x = (x - hpL) * 0.03;   // Freeverb's fixed input gain (0.015 per channel x 2)
+
+outL = outR = 0;
+c = 0;
+loop(8, outL += comb(x, c); outR += comb(x, c + 8); c += 1;);
+a = 0;
+loop(4, outL = allpass(outL, a); outR = allpass(outR, a + 4); a += 1;);
+
+wL = outL * wet1 + outR * wet2;
+wR = outR * wet1 + outL * wet2;
+wL *= 2;
+wR *= 2;
+eL = exp(2 * max(min(wL / 0.9, 10), -10));
+eR = exp(2 * max(min(wR / 0.9, 10), -10));
+spl0 = dryL * (1 - slider4) + 0.9 * (eL - 1) / (eL + 1) * slider4;
+spl1 = dryR * (1 - slider4) + 0.9 * (eR - 1) / (eR + 1) * slider4;
